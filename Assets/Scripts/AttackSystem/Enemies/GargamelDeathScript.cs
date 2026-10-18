@@ -21,8 +21,14 @@ public class GargamelDeathScript : MonoBehaviour
     [SerializeField] private VideoPlayer secretEndingVideo;
 
     [Header("Final Game Screen")]
+    [Tooltip("Drag the actual EndScreen GameObject here. Works when the object is inactive.")]
+    [SerializeField] private GameObject finalGameScreenReference;
+
+    [HideInInspector] [SerializeField] private bool callGameFlowCompletion = false; // Legacy serialized field
+
     [Tooltip("Scene to search first. If the UI has moved to DontDestroyOnLoad, name lookup falls back to all loaded scenes.")]
     [SerializeField] private string finalGameScreenSceneName = "GamePlayTest";
+
     [Tooltip(
         "Exact GameObject name of the final end screen UI."
     )]
@@ -127,10 +133,12 @@ public class GargamelDeathScript : MonoBehaviour
 
     private void ResolveFinalGameScreen()
     {
-        if (finalGameScreen != null)
+        if (finalGameScreenReference != null)
         {
+            finalGameScreen = finalGameScreenReference;
             return;
         }
+        if (finalGameScreen != null) return;
 
         if (string.IsNullOrWhiteSpace(finalGameScreenObjectName))
         {
@@ -461,6 +469,9 @@ public class GargamelDeathScript : MonoBehaviour
             video.targetCamera = Camera.main;
         SubscribeToVideo(video);
         video.Stop();
+        ResolveFinalGameScreen();
+        // Independent watchdog survives even if Gargamel is disabled mid-cutscene.
+        GargamelEndingCompletionGuard.Begin(video, finalGameScreen, normalEndingVideo, secretEndingVideo);
         Debug.Log("[GargamelDeathScript] Preparing ending clip '" + video.clip.name +
             "' on active player '" + video.gameObject.name + "'.", video);
         playbackStartedAt = Time.realtimeSinceStartup;
@@ -535,7 +546,6 @@ public class GargamelDeathScript : MonoBehaviour
         {
             return;
         }
-
         Debug.Log("[GargamelDeathScript] Ending clip prepared; starting playback.", player);
         playbackStartedAt = Time.realtimeSinceStartup;
         player.Play();
@@ -577,57 +587,41 @@ public class GargamelDeathScript : MonoBehaviour
 
     private void FinishEndingVideo(VideoPlayer endingVideo)
     {
-        if (finalGameScreen != null && finalGameScreen.activeInHierarchy)
-        {
-            Debug.Log("[GargamelDeathScript] End screen is already active; duplicate finish call ignored.", this);
-            return;
-        }
+        Debug.Log("[GargamelDeathScript] FinishEndingVideo entered.", this);
+        GargamelEndingCompletionGuard.CancelIfScreenAlreadyHandled();
 
-        Debug.Log("[GargamelDeathScript] FinishEndingVideo entered. Video='" +
-            (endingVideo != null ? endingVideo.gameObject.name : "<none>") + "'.", this);
         HideEndingVideo(normalEndingVideo);
         HideEndingVideo(secretEndingVideo);
-
-        Debug.Log("[GargamelDeathScript] Ending video finished. Video players hidden; resolving end screen.", this);
-
         ResolveFinalGameScreen();
 
-        // GameFlowManager owns the persistent end-of-game transition.
-        // Completing the cutscene marks the run complete, but switches to
-        // Credits mode. The interactive end screen belongs to the lobby UI,
-        // so restore that mode before activating it.
-        if (GameFlowManager.Instance != null)
-        {
-            GameFlowManager.Instance.FinalCutsceneFinished();
-        }
+        Time.timeScale = 1f;
         if (GameStateManager.Instance != null)
-        {
             GameStateManager.Instance.SetGameMode(GameStateManager.GameMode.Lobby);
-        }
-
-        if (PlayerStateManager.Instance != null)
-        {
-            PlayerStateManager.Instance.SetState(PlayerStateManager.PlayerState.Cutscene);
-        }
-
-        if (finalGameScreen != null)
-        {
-            StartCoroutine(ShowFinalGameScreenAndVerify());
-        }
-        else
-        {
-            Debug.LogWarning(
-                "[GargamelDeathScript] Ending finished, but no final game " +
-                "screen could be shown. Assign Final Game Screen or set " +
-                "Final Game Screen Object Name (currently '" +
-                finalGameScreenObjectName +
-                "').",
-                this
-            );
-        }
 
         Cursor.lockState = CursorLockMode.None;
         Cursor.visible = true;
+
+        if (finalGameScreen != null)
+        {
+            // Activate synchronously: StartCoroutine can be cancelled if the
+            // boss/controller object is deactivated by the game-flow transition.
+            ShowFinalGameScreen();
+            Debug.Log("[GargamelDeathScript] EndScreen activated at " +
+                GetHierarchyPath(finalGameScreen.transform) +
+                ", activeInHierarchy=" + finalGameScreen.activeInHierarchy, this);
+        }
+        else
+        {
+            Debug.LogError("[GargamelDeathScript] EndScreen not found. " +
+                "Assign Final Game Screen Reference in the Inspector, " +
+                "or check the EndScreen name and loaded scene.", this);
+        }
+
+        // WARNING: Some implementations of FinalCutsceneFinished load a
+        // different scene or disable the existing Canvas. Only opt in after
+        // checking GameFlowManager.cs. This option is off by default.
+        if (GameFlowManager.Instance != null)
+            GameFlowManager.Instance.FinalCutsceneFinished();
     }
 
     private void ShowFinalGameScreen()
@@ -804,5 +798,168 @@ public class GargamelDeathScript : MonoBehaviour
         video.renderMode = VideoRenderMode.CameraNearPlane;
         if (Camera.main != null)
             video.targetCamera = Camera.main;
+    }
+}
+
+/// <summary>
+/// Lives outside Gargamel so deactivating/destroying the boss cannot cancel
+/// video preparation, playback completion, or the end-screen transition.
+/// </summary>
+public sealed class GargamelEndingCompletionGuard : MonoBehaviour
+{
+    private static GargamelEndingCompletionGuard current;
+    private VideoPlayer video;
+    private VideoPlayer normalVideo;
+    private VideoPlayer secretVideo;
+    private GameObject screen;
+    private bool completed;
+    private float startedAt;
+    private float playbackAt;
+    private bool playbackStarted;
+
+    public static void Begin(VideoPlayer selected, GameObject endScreen,
+        VideoPlayer normal, VideoPlayer secret)
+    {
+        if (current != null) Destroy(current.gameObject);
+        GameObject host = new GameObject("FinalEndingCompletionGuard");
+        DontDestroyOnLoad(host);
+        current = host.AddComponent<GargamelEndingCompletionGuard>();
+        current.video = selected;
+        current.screen = endScreen;
+        current.normalVideo = normal;
+        current.secretVideo = secret;
+        current.startedAt = Time.realtimeSinceStartup;
+        selected.prepareCompleted += current.Prepared;
+        selected.loopPointReached += current.VideoFinished;
+        selected.errorReceived += current.VideoError;
+        current.StartCoroutine(current.Watch());
+        Debug.Log("[FinalEndingGuard] Persistent ending controller created.");
+    }
+
+    public static void CancelIfScreenAlreadyHandled()
+    {
+        if (current != null && current.screen != null && current.screen.activeInHierarchy)
+            current.Cleanup();
+    }
+
+    private void Prepared(VideoPlayer source)
+    {
+        if (completed || source != video) return;
+        playbackStarted = true;
+        playbackAt = Time.realtimeSinceStartup;
+        if (!video.isPlaying) video.Play();
+    }
+
+    private void VideoFinished(VideoPlayer source)
+    {
+        if (source == video) Complete();
+    }
+
+    private void VideoError(VideoPlayer source, string error)
+    {
+        Debug.LogError("[FinalEndingGuard] Video error: " + error);
+        if (source == video) Complete();
+    }
+
+    private IEnumerator Watch()
+    {
+        while (!completed)
+        {
+            if (screen != null && screen.activeInHierarchy)
+            {
+                Cleanup();
+                yield break;
+            }
+            if (video == null)
+            {
+                Complete();
+                yield break;
+            }
+            if (!playbackStarted && video.isPrepared)
+                Prepared(video);
+            if (!playbackStarted && Time.realtimeSinceStartup - startedAt > 20f)
+            {
+                Debug.LogWarning("[FinalEndingGuard] Video preparation timed out.");
+                Complete();
+                yield break;
+            }
+            if (playbackStarted)
+            {
+                double duration = video.length > 0 ? video.length :
+                    (video.clip != null ? video.clip.length : 0);
+                if (duration > 0 &&
+                    (video.time >= duration - 0.1 ||
+                     Time.realtimeSinceStartup - playbackAt >= duration + 3))
+                {
+                    Complete();
+                    yield break;
+                }
+            }
+            yield return null;
+        }
+    }
+
+    private void Complete()
+    {
+        if (completed) return;
+        if (screen != null && screen.activeInHierarchy)
+        {
+            Cleanup();
+            return;
+        }
+        completed = true;
+        Debug.Log("[FinalEndingGuard] Ending complete. Activating EndScreen.");
+        Hide(normalVideo);
+        if (secretVideo != normalVideo) Hide(secretVideo);
+        Time.timeScale = 1f;
+        if (GameStateManager.Instance != null)
+            GameStateManager.Instance.SetGameMode(GameStateManager.GameMode.Lobby);
+        if (GameFlowManager.Instance != null)
+            GameFlowManager.Instance.FinalCutsceneFinished();
+        if (screen != null)
+        {
+            for (Transform t = screen.transform; t != null; t = t.parent)
+            {
+                t.gameObject.SetActive(true);
+                Canvas c = t.GetComponent<Canvas>();
+                if (c != null) c.enabled = true;
+                CanvasGroup g = t.GetComponent<CanvasGroup>();
+                if (g != null)
+                {
+                    g.alpha = 1f;
+                    g.interactable = true;
+                    g.blocksRaycasts = true;
+                }
+            }
+            Canvas.ForceUpdateCanvases();
+            Debug.Log("[FinalEndingGuard] EndScreen activeInHierarchy=" + screen.activeInHierarchy);
+        }
+        else Debug.LogError("[FinalEndingGuard] No EndScreen reference. Assign it on Gargamel.");
+        Cursor.lockState = CursorLockMode.None;
+        Cursor.visible = true;
+        Cleanup();
+    }
+
+    private static void Hide(VideoPlayer player)
+    {
+        if (player == null) return;
+        player.Stop();
+        player.targetCameraAlpha = 0f;
+        player.renderMode = VideoRenderMode.APIOnly;
+        player.enabled = false;
+        player.gameObject.SetActive(false);
+    }
+
+    private void Cleanup()
+    {
+        completed = true;
+        if (video != null)
+        {
+            video.prepareCompleted -= Prepared;
+            video.loopPointReached -= VideoFinished;
+            video.errorReceived -= VideoError;
+        }
+        if (current == this) current = null;
+        Destroy(gameObject);
     }
 }
